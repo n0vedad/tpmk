@@ -25,32 +25,31 @@ type sshClientOptions struct {
 	knownHostsFile string
 	insecure       bool
 	proxySocks5    string
+	interactive    bool
 }
 
 func newSSHClientCommand() *cobra.Command {
 	var opt sshClientOptions
 
 	cmd := &cobra.Command{
-		Use:   "client <handle> <user@host:port> <command>",
-		Short: "Execute a command remotely",
+		Use:   "client <handle> <user@host:port> [command]",
+		Short: "Execute a command remotely or start an interactive session",
 		Long: `Executes a command on an SSH server using a key in the TPM
-and reads/writes to it via STDIN/STDOUT. Supports host and
-client certificates, with the client certificate optionally
-read from an NV index in the TPM as well.
+or starts an interactive session. Supports host and client certificates,
+with the client certificate optionally read from an NV index in the TPM.
 
-Unless -k is used, a know hosts file in OpenSSH format needs
+Unless -k is used, a known hosts file in OpenSSH format needs
 to be provided with --known-hosts/-s. If none is given in the
 command line, $HOME/.ssh/known_hosts will be used if available
 followed by /etc/ssh/ssh_known_hosts.
 
 Note that no assumptions are made regarding user or port. Both
-need to be speficied in the command in the typical format:
+need to be specified in the command in the typical format:
 <user>@<host>:<port>
 `,
 		Example: `  tpmk ssh client 0x81000000 root@host:22 "ls -l"
-
-  tpmk ssh client -i 0x1500000 0x81000000 root@host:22 "whoami"`,
-		Args: cobra.ExactArgs(3),
+  tpmk ssh client -i 0x1500000 0x81000000 root@host:22`,
+		Args: cobra.RangeArgs(2, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSSHClient(opt, args)
 		},
@@ -66,6 +65,7 @@ need to be speficied in the command in the typical format:
 	flags.StringVarP(&opt.crtFormat, "crt-format", "f", "openssh", "Format of the client cert")
 	flags.BoolVarP(&opt.insecure, "insecure", "k", false, "Accept any host key")
 	flags.StringVarP(&opt.proxySocks5, "socks5-proxy", "P", "", "Socks5 proxy string")
+	flags.BoolVarP(&opt.interactive, "interactive", "t", false, "Start an interactive session")
 	return cmd
 }
 
@@ -75,9 +75,11 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 		return err
 	}
 	remote := args[1]
-	command := args[2]
+	var command string
+	if len(args) > 2 {
+		command = args[2]
+	}
 
-	// Confirm that the provided arguments make sense
 	if opt.insecure && opt.knownHostsFile != "" {
 		return errors.New("can't use -k with -s")
 	}
@@ -85,7 +87,6 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 		return errors.New("can use either -c or -i, not both")
 	}
 
-	// Parse the remote location into user and host
 	s := strings.Split(remote, "@")
 	if len(s) != 2 {
 		return errors.New("require user@host:port for remote endpoint")
@@ -93,14 +94,12 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 	user := s[0]
 	host := s[1]
 
-	// Open the TPM
 	dev, err := tpmk.OpenDevice(opt.device)
 	if err != nil {
 		return errors.Wrap(err, "opening "+opt.device)
 	}
 	defer dev.Close()
 
-	// Use the key in the TPM to build an ssh.Signer
 	pk, err := tpmk.NewRSAPrivateKey(dev, keyHandle, opt.keyPassword)
 	if err != nil {
 		return errors.Wrap(err, "accessing key")
@@ -110,11 +109,10 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 		return errors.Wrap(err, "invalid key")
 	}
 
-	// Use client certificate, if provided to extend the ssh.Signer with a cerfificate
 	if opt.crtFile != "" || opt.crtHandle != "" {
 		var b []byte
 		var err error
-		if opt.crtHandle != "" { // Read the cert from NV
+		if opt.crtHandle != "" {
 			crtHandle, err := parseHandle(opt.crtHandle)
 			if err != nil {
 				return err
@@ -123,14 +121,13 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 			if err != nil {
 				return errors.Wrap(err, "reading crt from TPM")
 			}
-		} else { // Read the cert from file
+		} else {
 			b, err = ioutil.ReadFile(opt.crtFile)
 			if err != nil {
 				return errors.Wrap(err, "reading client crt file")
 			}
 		}
 
-		// Unmarshall the certificate according to the provided format
 		var pub ssh.PublicKey
 		switch opt.crtFormat {
 		case "openssh":
@@ -144,34 +141,27 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 			return errors.Wrap(err, "parsing client crt file")
 		}
 
-		// Make sure the provided cert really was one
 		crt, ok := pub.(*ssh.Certificate)
 		if !ok {
 			return errors.New("client cert file not of the right type")
 		}
 
-		// Extend the signer used in the handshake to present the cert to the server
 		signer, err = ssh.NewCertSigner(crt, signer)
 		if err != nil {
 			return err
 		}
 	}
 
-	// Find a known_hosts file with valid host keys or certificates. Use the following search order:
-	// 1. Proviced by command line options
-	// 2. Disabled via command line (-k)
-	// 3. $HOME/.ssh/known_hosts if $HOME is non-empty
-	// 4. /etc/ssh/ssh_known_hosts
 	var hostKeyCallback ssh.HostKeyCallback
 	switch {
-	case opt.knownHostsFile != "": // Parse and use the given known_hosts file
+	case opt.knownHostsFile != "":
 		hostKeyCallback, err = knownhosts.New(opt.knownHostsFile)
 		if err != nil {
 			return errors.Wrap(err, "reading host key file")
 		}
-	case opt.insecure: // Don't validate and accept anything presented by the host
+	case opt.insecure:
 		hostKeyCallback = ssh.InsecureIgnoreHostKey()
-	default: // Try to find a known hosts file, give up if there isn't one
+	default:
 		if home := os.Getenv("HOME"); home != "" {
 			f := filepath.Join(home, ".ssh/known_hosts")
 			hostKeyCallback, err = knownhosts.New(f)
@@ -188,7 +178,6 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 		}
 	}
 
-	// Build SSH client config with just public key auth
 	config := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{
@@ -221,16 +210,37 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 		}
 		defer client.Close()
 	}
-	
+
 	session, err := client.NewSession()
 	if err != nil {
 		return errors.Wrap(err, "creating SSH session")
 	}
 	defer session.Close()
 
-	// Hook up in/out/err to the command and execute it
-	session.Stdin = os.Stdin
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
-	return session.Run(command)
+	if opt.interactive {
+		// Request pseudo terminal
+		if err := session.RequestPty("xterm", 40, 80, ssh.TerminalModes{}); err != nil {
+			return errors.Wrap(err, "requesting pseudo terminal")
+		}
+
+		// Set up stdin/stdout/stderr
+		session.Stdin = os.Stdin
+		session.Stdout = os.Stdout
+		session.Stderr = os.Stderr
+
+		// Start interactive shell
+		if err := session.Shell(); err != nil {
+			return errors.Wrap(err, "starting shell")
+		}
+
+		// Wait for session to finish
+		return session.Wait()
+	} else if command != "" {
+		// Run a single command
+		session.Stdout = os.Stdout
+		session.Stderr = os.Stderr
+		return session.Run(command)
+	} else {
+		return errors.New("either a command or the interactive flag must be provided")
+	}
 }
