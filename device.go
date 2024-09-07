@@ -22,7 +22,7 @@ func OpenDevice(device string) (io.ReadWriteCloser, error) {
 		}
 		return OpenSim()
 	default:
-		return openImpl(device)
+		return openImpl()
 	}
 }
 

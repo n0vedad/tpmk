@@ -10,6 +10,6 @@ import (
 )
 
 // openImpl opens the TPM on Windows
-func openImpl(_ string) (io.ReadWriteCloser, error) {
+func openImpl() (io.ReadWriteCloser, error) {
 	return tpmutil.OpenTPM()
 }
