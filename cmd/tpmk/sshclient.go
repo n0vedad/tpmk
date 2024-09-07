@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/folbricht/tpmk"
@@ -80,6 +81,7 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 		command = args[2]
 	}
 
+	// Confirm that the provided arguments make sense
 	if opt.insecure && opt.knownHostsFile != "" {
 		return errors.New("can't use -k with -s")
 	}
@@ -87,6 +89,7 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 		return errors.New("can use either -c or -i, not both")
 	}
 
+	// Parse the remote location into user and host
 	s := strings.Split(remote, "@")
 	if len(s) != 2 {
 		return errors.New("require user@host:port for remote endpoint")
@@ -94,12 +97,14 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 	user := s[0]
 	host := s[1]
 
+	// Open the TPM
 	dev, err := tpmk.OpenDevice(opt.device)
 	if err != nil {
 		return errors.Wrap(err, "opening "+opt.device)
 	}
 	defer dev.Close()
 
+	// Use the key in the TPM to build an ssh.Signer
 	pk, err := tpmk.NewRSAPrivateKey(dev, keyHandle, opt.keyPassword)
 	if err != nil {
 		return errors.Wrap(err, "accessing key")
@@ -109,10 +114,11 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 		return errors.Wrap(err, "invalid key")
 	}
 
+	// Use client certificate, if provided to extend the ssh.Signer with a cerfificate
 	if opt.crtFile != "" || opt.crtHandle != "" {
 		var b []byte
 		var err error
-		if opt.crtHandle != "" {
+		if opt.crtHandle != "" { // Read the cert from NV
 			crtHandle, err := parseHandle(opt.crtHandle)
 			if err != nil {
 				return err
@@ -121,13 +127,14 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 			if err != nil {
 				return errors.Wrap(err, "reading crt from TPM")
 			}
-		} else {
+		} else { // Read the cert from file
 			b, err = ioutil.ReadFile(opt.crtFile)
 			if err != nil {
 				return errors.Wrap(err, "reading client crt file")
 			}
 		}
 
+		// Unmarshall the certificate according to the provided format
 		var pub ssh.PublicKey
 		switch opt.crtFormat {
 		case "openssh":
@@ -141,43 +148,62 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 			return errors.Wrap(err, "parsing client crt file")
 		}
 
+		// Make sure the provided cert really was one
 		crt, ok := pub.(*ssh.Certificate)
 		if !ok {
 			return errors.New("client cert file not of the right type")
 		}
 
+		// Extend the signer used in the handshake to present the cert to the server
 		signer, err = ssh.NewCertSigner(crt, signer)
 		if err != nil {
 			return err
 		}
 	}
 
+	// Find a known_hosts file with valid host keys or certificates. Use the following search order:
+	// 1. Provided by command line options
+	// 2. Disabled via command line (-k)
+	// 3. $HOME/.ssh/known_hosts (Unix) or %USERPROFILE%\.ssh\known_hosts (Windows) if the environment variable is non-empty
+	// 4. If no known_hosts file is found, return an error
 	var hostKeyCallback ssh.HostKeyCallback
 	switch {
-	case opt.knownHostsFile != "":
+	case opt.knownHostsFile != "": // Parse and use the given known_hosts file
 		hostKeyCallback, err = knownhosts.New(opt.knownHostsFile)
 		if err != nil {
 			return errors.Wrap(err, "reading host key file")
 		}
-	case opt.insecure:
+	case opt.insecure: // Don't validate and accept anything presented by the host
 		hostKeyCallback = ssh.InsecureIgnoreHostKey()
-	default:
-		if home := os.Getenv("HOME"); home != "" {
-			f := filepath.Join(home, ".ssh/known_hosts")
-			hostKeyCallback, err = knownhosts.New(f)
+	default: // Try to find a known hosts file in the user's home directory
+		var knownHostsFile string
+		if runtime.GOOS == "windows" {
+			userProfile := os.Getenv("USERPROFILE")
+			if userProfile != "" {
+				knownHostsFile = filepath.Join(userProfile, ".ssh", "known_hosts")
+			}
+		} else {
+			home := os.Getenv("HOME")
+			if home != "" {
+				knownHostsFile = filepath.Join(home, ".ssh", "known_hosts")
+			}
+		}
+
+		if knownHostsFile != "" {
+			hostKeyCallback, err = knownhosts.New(knownHostsFile)
 			if err == nil {
 				break
 			}
 			if !os.IsNotExist(err) {
-				return errors.Wrap(err, "reading known_hosts file: "+f)
+				return errors.Wrap(err, "reading known_hosts file: "+knownHostsFile)
 			}
 		}
-		hostKeyCallback, err = knownhosts.New("/etc/ssh/ssh_known_hosts")
-		if err != nil {
-			return errors.New("unable to find a known_hosts file")
-		}
+
+		// If we reach here, we couldn't find a valid known_hosts file
+		return errors.New("unable to find a known_hosts file")
 	}
 
+	// Build SSH client config with just public key auth
 	config := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{
