@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/folbricht/tpmk"
+	"github.com/google/go-tpm/tpmutil"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
@@ -70,140 +72,176 @@ need to be specified in the command in the typical format:
 	return cmd
 }
 
+// main function that orchestrates the SSH client connection process
 func runSSHClient(opt sshClientOptions, args []string) error {
-	keyHandle, err := parseHandle(args[0])
+	keyHandle, user, host, command, err := parseArguments(args)
 	if err != nil {
 		return err
 	}
+
+	if err := validateArguments(opt); err != nil {
+		return err
+	}
+
+	signer, dev, err := setupTPMAndSigner(opt, keyHandle)
+	if err != nil {
+		return err
+	}
+	defer dev.Close()
+
+	if opt.crtFile != "" || opt.crtHandle != "" {
+		signer, err = setupClientCertificate(opt, dev, signer)
+		if err != nil {
+			return err
+		}
+	}
+
+	hostKeyCallback, err := setupHostKeyCallback(opt)
+	if err != nil {
+		return err
+	}
+
+	client, err := createSSHClient(opt, user, host, signer, hostKeyCallback)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	return executeSSHSession(client, opt, command)
+}
+
+// processes the command line arguments
+func parseArguments(args []string) (tpmutil.Handle, string, string, string, error) {
+	keyHandle, err := parseHandle(args[0])
+	if err != nil {
+		return 0, "", "", "", err
+	}
+
 	remote := args[1]
+	s := strings.Split(remote, "@")
+	if len(s) != 2 {
+		return 0, "", "", "", errors.New("require user@host:port for remote endpoint")
+	}
+	user := s[0]
+	host := s[1]
+
 	var command string
 	if len(args) > 2 {
 		command = args[2]
 	}
 
-	// Confirm that the provided arguments make sense
+	return keyHandle, user, host, command, nil
+}
+
+// checks for valid combinations of command line options
+func validateArguments(opt sshClientOptions) error {
 	if opt.insecure && opt.knownHostsFile != "" {
 		return errors.New("can't use -k with -s")
 	}
 	if opt.crtFile != "" && opt.crtHandle != "" {
 		return errors.New("can use either -c or -i, not both")
 	}
+	return nil
+}
 
-	// Parse the remote location into user and host
-	s := strings.Split(remote, "@")
-	if len(s) != 2 {
-		return errors.New("require user@host:port for remote endpoint")
-	}
-	user := s[0]
-	host := s[1]
-
-	// Open the TPM
+// opens the TPM and creates an SSH signer
+func setupTPMAndSigner(opt sshClientOptions, keyHandle tpmutil.Handle) (ssh.Signer, io.ReadWriteCloser, error) {
 	dev, err := tpmk.OpenDevice(opt.device)
 	if err != nil {
-		return errors.Wrap(err, "opening "+opt.device)
+		return nil, nil, errors.Wrap(err, "opening "+opt.device)
 	}
-	defer dev.Close()
 
-	// Use the key in the TPM to build an ssh.Signer
 	pk, err := tpmk.NewRSAPrivateKey(dev, keyHandle, opt.keyPassword)
 	if err != nil {
-		return errors.Wrap(err, "accessing key")
+		return nil, nil, errors.Wrap(err, "accessing key")
 	}
+
 	signer, err := ssh.NewSignerFromSigner(pk)
 	if err != nil {
-		return errors.Wrap(err, "invalid key")
+		return nil, nil, errors.Wrap(err, "invalid key")
 	}
 
-	// Use client certificate, if provided to extend the ssh.Signer with a cerfificate
-	if opt.crtFile != "" || opt.crtHandle != "" {
-		var b []byte
-		var err error
-		if opt.crtHandle != "" { // Read the cert from NV
-			crtHandle, err := parseHandle(opt.crtHandle)
-			if err != nil {
-				return err
-			}
-			b, err = tpmk.NVRead(dev, crtHandle, "")
-			if err != nil {
-				return errors.Wrap(err, "reading crt from TPM")
-			}
-		} else { // Read the cert from file
-			b, err = ioutil.ReadFile(opt.crtFile)
-			if err != nil {
-				return errors.Wrap(err, "reading client crt file")
-			}
-		}
+	return signer, dev, nil
+}
 
-		// Unmarshall the certificate according to the provided format
-		var pub ssh.PublicKey
-		switch opt.crtFormat {
-		case "openssh":
-			pub, err = tpmk.ParseOpenSSHPublicKey(b)
-		case "wire":
-			pub, err = ssh.ParsePublicKey(b)
-		default:
-			return fmt.Errorf("unsupported certificate format '%s", opt.crtFormat)
-		}
+// configures the client certificate if provided
+func setupClientCertificate(opt sshClientOptions, dev io.ReadWriteCloser, signer ssh.Signer) (ssh.Signer, error) {
+	var b []byte
+	var err error
+
+	if opt.crtHandle != "" {
+		crtHandle, err := parseHandle(opt.crtHandle)
 		if err != nil {
-			return errors.Wrap(err, "parsing client crt file")
+			return nil, err
 		}
-
-		// Make sure the provided cert really was one
-		crt, ok := pub.(*ssh.Certificate)
-		if !ok {
-			return errors.New("client cert file not of the right type")
-		}
-
-		// Extend the signer used in the handshake to present the cert to the server
-		signer, err = ssh.NewCertSigner(crt, signer)
+		b, err = tpmk.NVRead(dev, crtHandle, "")
 		if err != nil {
-			return err
+			return nil, errors.Wrap(err, "reading crt from TPM")
+		}
+	} else {
+		b, err = ioutil.ReadFile(opt.crtFile)
+		if err != nil {
+			return nil, errors.Wrap(err, "reading client crt file")
 		}
 	}
 
-	// Find a known_hosts file with valid host keys or certificates. Use the following search order:
-	// 1. Provided by command line options
-	// 2. Disabled via command line (-k)
-	// 3. $HOME/.ssh/known_hosts (Unix) or %USERPROFILE%\.ssh\known_hosts (Windows) if the environment variable is non-empty
-	// 4. If no known_hosts file is found, return an error
-	var hostKeyCallback ssh.HostKeyCallback
-	switch {
-	case opt.knownHostsFile != "": // Parse and use the given known_hosts file
-		hostKeyCallback, err = knownhosts.New(opt.knownHostsFile)
-		if err != nil {
-			return errors.Wrap(err, "reading host key file")
-		}
-	case opt.insecure: // Don't validate and accept anything presented by the host
-		hostKeyCallback = ssh.InsecureIgnoreHostKey()
-	default: // Try to find a known hosts file in the user's home directory
-		var knownHostsFile string
-		if runtime.GOOS == "windows" {
-			userProfile := os.Getenv("USERPROFILE")
-			if userProfile != "" {
-				knownHostsFile = filepath.Join(userProfile, ".ssh", "known_hosts")
-			}
-		} else {
-			home := os.Getenv("HOME")
-			if home != "" {
-				knownHostsFile = filepath.Join(home, ".ssh", "known_hosts")
-			}
-		}
-
-		if knownHostsFile != "" {
-			hostKeyCallback, err = knownhosts.New(knownHostsFile)
-			if err == nil {
-				break
-			}
-			if !os.IsNotExist(err) {
-				return errors.Wrap(err, "reading known_hosts file: "+knownHostsFile)
-			}
-		}
-
-		// If we reach here, we couldn't find a valid known_hosts file
-		return errors.New("unable to find a known_hosts file")
+	var pub ssh.PublicKey
+	switch opt.crtFormat {
+	case "openssh":
+		pub, err = tpmk.ParseOpenSSHPublicKey(b)
+	case "wire":
+		pub, err = ssh.ParsePublicKey(b)
+	default:
+		return nil, fmt.Errorf("unsupported certificate format '%s", opt.crtFormat)
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "parsing client crt file")
 	}
 
-	// Build SSH client config with just public key auth
+	crt, ok := pub.(*ssh.Certificate)
+	if !ok {
+		return nil, errors.New("client cert file not of the right type")
+	}
+
+	return ssh.NewCertSigner(crt, signer)
+}
+
+// configures the host key callback based on the options
+func setupHostKeyCallback(opt sshClientOptions) (ssh.HostKeyCallback, error) {
+	if opt.knownHostsFile != "" {
+		return knownhosts.New(opt.knownHostsFile)
+	}
+
+	if opt.insecure {
+		return ssh.InsecureIgnoreHostKey(), nil
+	}
+
+	knownHostsFile := findKnownHostsFile()
+	if knownHostsFile != "" {
+		return knownhosts.New(knownHostsFile)
+	}
+
+	return nil, errors.New("unable to find a known_hosts file")
+}
+
+// attempts to locate the known_hosts file
+func findKnownHostsFile() string {
+	if runtime.GOOS == "windows" {
+		userProfile := os.Getenv("USERPROFILE")
+		if userProfile != "" {
+			return filepath.Join(userProfile, ".ssh", "known_hosts")
+		}
+	} else {
+		home := os.Getenv("HOME")
+		if home != "" {
+			return filepath.Join(home, ".ssh", "known_hosts")
+		}
+	}
+	return ""
+}
+
+// establishes the SSH connection
+func createSSHClient(opt sshClientOptions, user, host string, signer ssh.Signer, hostKeyCallback ssh.HostKeyCallback) (*ssh.Client, error) {
 	config := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{
@@ -212,31 +250,35 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 		HostKeyCallback: hostKeyCallback,
 	}
 
-	var client *ssh.Client
 	if opt.proxySocks5 != "" {
-		socksConnection, err := proxy.SOCKS5("tcp", opt.proxySocks5, nil, proxy.Direct)
-		if err != nil {
-			return errors.Wrap(err, "could not create socks5 proxy "+opt.proxySocks5)
-		}
-		conn, err := socksConnection.Dial("tcp", host)
-		if err != nil {
-			return errors.Wrap(err, "could not create connection with socks.")
-		}
-		defer conn.Close()
-		clientConnection, chans, reqs, err := ssh.NewClientConn(conn, host, config)
-		if err != nil {
-			return errors.Wrap(err, "could not create socks5 proxy client "+opt.proxySocks5)
-		}
-		client = ssh.NewClient(clientConnection, chans, reqs)
-		defer client.Close()
-	} else {
-		client, err = ssh.Dial("tcp", host, config)
-		if err != nil {
-			return errors.Wrap(err, "connecting to "+host)
-		}
-		defer client.Close()
+		return createProxyClient(opt.proxySocks5, host, config)
 	}
 
+	return ssh.Dial("tcp", host, config)
+}
+
+// creates an SSH client through a SOCKS5 proxy
+func createProxyClient(proxyAddr, host string, config *ssh.ClientConfig) (*ssh.Client, error) {
+	socksConnection, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create socks5 proxy "+proxyAddr)
+	}
+
+	conn, err := socksConnection.Dial("tcp", host)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create connection with socks")
+	}
+
+	clientConn, chans, reqs, err := ssh.NewClientConn(conn, host, config)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create socks5 proxy client "+proxyAddr)
+	}
+
+	return ssh.NewClient(clientConn, chans, reqs), nil
+}
+
+// runs the SSH session, either interactively or with a single command
+func executeSSHSession(client *ssh.Client, opt sshClientOptions, command string) error {
 	session, err := client.NewSession()
 	if err != nil {
 		return errors.Wrap(err, "creating SSH session")
@@ -244,29 +286,34 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 	defer session.Close()
 
 	if opt.interactive {
-		// Request pseudo terminal
-		if err := session.RequestPty("xterm", 40, 80, ssh.TerminalModes{}); err != nil {
-			return errors.Wrap(err, "requesting pseudo terminal")
-		}
-
-		// Set up stdin/stdout/stderr
-		session.Stdin = os.Stdin
-		session.Stdout = os.Stdout
-		session.Stderr = os.Stderr
-
-		// Start interactive shell
-		if err := session.Shell(); err != nil {
-			return errors.Wrap(err, "starting shell")
-		}
-
-		// Wait for session to finish
-		return session.Wait()
+		return runInteractiveSession(session)
 	} else if command != "" {
-		// Run a single command
-		session.Stdout = os.Stdout
-		session.Stderr = os.Stderr
-		return session.Run(command)
+		return runSingleCommand(session, command)
 	} else {
 		return errors.New("either a command or the interactive flag must be provided")
 	}
+}
+
+// starts an interactive SSH session
+func runInteractiveSession(session *ssh.Session) error {
+	if err := session.RequestPty("xterm", 40, 80, ssh.TerminalModes{}); err != nil {
+		return errors.Wrap(err, "requesting pseudo terminal")
+	}
+
+	session.Stdin = os.Stdin
+	session.Stdout = os.Stdout
+	session.Stderr = os.Stderr
+
+	if err := session.Shell(); err != nil {
+		return errors.Wrap(err, "starting shell")
+	}
+
+	return session.Wait()
+}
+
+// executes a single command over SSH
+func runSingleCommand(session *ssh.Session, command string) error {
+	session.Stdout = os.Stdout
+	session.Stderr = os.Stderr
+	return session.Run(command)
 }
