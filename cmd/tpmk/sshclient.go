@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -87,6 +89,11 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 	}
 	if opt.crtFile != "" && opt.crtHandle != "" {
 		return errors.New("can use either -c or -i, not both")
+	}
+
+	// Check TPM device access for UNIX
+	if runtime.GOOS == "linux" && !canAccessTPM(opt.device) {
+		return handleTPMAccess()
 	}
 
 	// Parse the remote location into user and host
@@ -269,4 +276,79 @@ func runSSHClient(opt sshClientOptions, args []string) error {
 	} else {
 		return errors.New("either a command or the interactive flag must be provided")
 	}
+}
+
+func canAccessTPM(device string) bool {
+	_, err := os.OpenFile(device, os.O_RDWR, 0)
+	return err == nil
+}
+
+func handleTPMAccess() error {
+	fmt.Println("You don't have sufficient permissions to access the TPM device.")
+	fmt.Println("Choose an option to resolve this issue:")
+	fmt.Println("1. Add current user to the 'tss' group (recommended, requires sudo)")
+	fmt.Println("2. Run tpmk with sudo (not recommended)")
+	fmt.Println("3. Exit")
+
+	var choice int
+	fmt.Print("Enter your choice (1-3): ")
+	fmt.Scanln(&choice)
+
+	switch choice {
+	case 1:
+		return addUserToTssGroup()
+	case 2:
+		fmt.Println("Please run the command again with sudo.")
+		os.Exit(0)
+	case 3:
+		fmt.Println("Exiting.")
+		os.Exit(0)
+	default:
+		return errors.New("invalid choice")
+	}
+	return nil
+}
+
+func addUserToTssGroup() error {
+	currentUser, err := user.Current()
+	if err != nil {
+		return errors.Wrap(err, "getting current user")
+	}
+
+	// Check if the tss group exists
+	_, err = exec.Command("getent", "group", "tss").Output()
+	if err != nil {
+		// tss group doesn't exist, offer to create it
+		fmt.Println("The 'tss' group does not exist. Would you like to create it?")
+		fmt.Print("Enter 'yes' to create the group or any other key to exit: ")
+		var response string
+		fmt.Scanln(&response)
+		if strings.ToLower(response) != "yes" {
+			fmt.Println("Exiting without making changes.")
+			os.Exit(0)
+		}
+
+		// Create tss group
+		cmd := exec.Command("sudo", "groupadd", "tss")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return errors.Wrap(err, "creating tss group")
+		}
+		fmt.Println("The 'tss' group has been created.")
+	}
+
+	// Add user to tss group
+	cmd := exec.Command("sudo", "usermod", "-a", "-G", "tss", currentUser.Username)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return errors.Wrap(err, "adding user to tss group")
+	}
+
+	fmt.Println("User has been added to the 'tss' group.")
+	fmt.Println("Please log out and log back in for the changes to take effect.")
+	fmt.Println("After logging back in, run the tpmk command again.")
+	os.Exit(0)
+	return nil
 }
