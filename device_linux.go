@@ -19,49 +19,27 @@ import (
 
 // openImpl opens the TPM identified by the device name
 func openImpl() (io.ReadWriteCloser, error) {
-    device, err := detectTPMDevice()
-    if err != nil {
-        return nil, errors.Wrap(err, "detecting TPM device")
-    }
+	device, err := detectTPMDevice()
+	if err != nil {
+		return nil, errors.Wrap(err, "detecting TPM device")
+	}
 
 	// Initial check for TPM access
-    if !canAccessTPM(device) {
-        return nil, errors.New("insufficient permissions to access TPM")
-    }
+	if !canAccessTPM(device) {
+		fmt.Printf("Cannot access TPM device %s. Attempting to set up access...\n", device)
+		if err := setupTPMAccess(device); err != nil {
+			return nil, errors.Wrap(err, "setting up TPM access")
+		}
+	}
 
-    return tpm2.OpenTPM(device)
+	return tpm2.OpenTPM(device)
 }
 
 // canAccessTPM checks if the current user can access the TPM device
 func canAccessTPM(device string) bool {
-    _, err := os.OpenFile(device, os.O_RDWR, 0)
-    if err == nil {
-        return true
-    }
-
-    fmt.Printf("Cannot access TPM device %s. Attempting to set up access...\n", device)
-    if promptForSetup() {
-        if err := setupTPMAccess(device); err != nil {
-            fmt.Printf("Failed to set up TPM access: %v\n", err)
-            return false
-        }
-        return true
-    }
-    return false
+	_, err := os.OpenFile(device, os.O_RDWR, 0)
+	return err == nil
 }
-
-// promptForSetup is a helper function to query access
-func promptForSetup() bool {
-    fmt.Println("You don't have sufficient permissions to access the TPM device.")
-    fmt.Println("Would you like to set up TPM access for your user?")
-    fmt.Println("This requires sudo privileges for adding your user to a special group and setting up UDEV rules.")
-    fmt.Print("Enter 'yes' to proceed or any other key to exit: ")
-
-    var response string
-    fmt.Scanln(&response)
-    return strings.ToLower(response) == "yes"
-}
-
 
 // detectTPMDevice attempts to find the TPM device on the system
 func detectTPMDevice() (string, error) {
