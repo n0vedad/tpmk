@@ -18,7 +18,7 @@ import (
 )
 
 // openImpl opens the TPM identified by the device name
-func openImpl() (io.ReadWriteCloser, error) {
+func openImpl(device string) (io.ReadWriteCloser, error) {
 	device, err := detectTPMDevice()
 	if err != nil {
 		return nil, errors.Wrap(err, "detecting TPM device")
